@@ -1,0 +1,1 @@
+This parser is based on the implementation of [[Duper](https://github.com/leanprover-community/duper)].
