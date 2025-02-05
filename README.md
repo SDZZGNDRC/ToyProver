@@ -1,6 +1,13 @@
 # toyprover
-(WIP)
+(WIP)  
 This repo build a (toy-level) first order logic prover in Lean 4.
+
+## usage
+
+```bash
+lake build toyprover
+.lake/build/bin/toyprover <tptp file path>
+```
 
 ## test
 
