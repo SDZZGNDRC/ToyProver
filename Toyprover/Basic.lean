@@ -1,5 +1,6 @@
 import Toyprover.TPTPParser.PrattParser
 import Toyprover.FOL.Basic
+import Toyprover.FOL.Unify
 
 open FOLFormula TPTP.Parser
 
@@ -91,6 +92,7 @@ structure Config where
   timeout : Nat := 1000 -- timeout in ms
   verbose : Bool := false
   debug : Bool := false
+  prover : String := "gilmore"
 
 structure Context where
   config : Config
@@ -144,6 +146,53 @@ partial def gilmore (fm : Formula) : SolverM Nat := do
   return List.length <| (← gilmore_loop (simpdnf sfm) cntms funcs fvs 0 [[]] [] [])
 
 
+partial def unify_literals (env : INST) (tmp : Formula × Formula) : Except String INST := do
+  match tmp with
+  | (.R p1 a1, .R p2 a2) => unify env [(.Fn p1 a1, .Fn p2 a2)]
+  | (.Not p, .Not q) => unify_literals env (p, q)
+  | (.False, .False) => return env
+  | _ => throw "Can't unify literals"
+
+partial def unify_complements (env : INST) (tmp : Formula × Formula) : Except String INST :=
+  unify_literals env (tmp.1, tmp.2.negate)
+
+partial def unify_refute (djs : DNFT) (env : INST) : Except String INST := do
+  match djs with
+  | [] => return env
+  | d :: odjs =>
+    let (pos, neg) := List.partition Formula.positive d
+    let tmp := List.product pos neg
+    let f (p : Formula × Formula) : Except String INST := do
+      let new_e ← unify_complements env p
+      unify_refute odjs new_e
+    tryFirst f tmp
+where
+  tryFirst (act : Formula × Formula → Except String INST) (cs : List (Formula × Formula)) : Except String INST := do
+    match cs with
+    | [] => throw "No unifiable pairs"
+    | c :: ocs =>
+      match act c with
+      | .ok e => return e
+      | .error _ => tryFirst act ocs
+
+partial def prawitz_loop (djs0 : DNFT) (fvs : List String) (djs : DNFT) (n : Nat) : SolverM (INST × Nat) := do
+  guardTimeout
+  let l := fvs.length
+  let newVars := (List.range l).map λ k => FOLTerm.Var ("_" ++ s!"{n*l + k}")
+  let inst := λ (fm : Formula) => fm.subst (fvs.zip newVars)
+  let djs1 := distrib (List.map (List.map inst) djs0) djs
+  match unify_refute djs1 [] with
+  | .ok res => return (res, n)
+  | .error _ => prawitz_loop djs0 fvs djs1 (n + 1)
+where
+  distrib (d1 d2 : DNFT) : DNFT :=
+    List.foldr (fun x IH => if ∀ y ∈ IH, x != y then x :: IH else IH) [] <| -- Here do not influence the correctness, but it is faster.
+      (d1.product d2).map fun pq => (pq.1 ++ pq.2).eraseDup
+
+partial def prawitz (fm : Formula) : SolverM Nat := do
+  let fm0 := skolemize (.Not (Formula.generalize fm))
+  return (← prawitz_loop (simpdnf fm0) (fm0.fvs) [[]] 0).2
+
 def solve (path : String) : SolverM String := do
   let cmds ← TPTP.compileFile path
   -- ensure there exists some conjectures
@@ -158,7 +207,7 @@ def solve (path : String) : SolverM String := do
 
   -- start solver
   try
-    let res := (← gilmore input)
+    let res := (← prawitz input)
     return s!"success: {res}"
   catch e =>
     return e.toString
