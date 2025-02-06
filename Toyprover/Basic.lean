@@ -193,6 +193,49 @@ partial def prawitz (fm : Formula) : SolverM Nat := do
   let fm0 := skolemize (.Not (Formula.generalize fm))
   return (← prawitz_loop (simpdnf fm0) (fm0.fvs) [[]] 0).2
 
+partial def tableau (fms lits : List Formula) (n : Nat) (cont : INST → Nat → SolverM (Except String Nat)) (env : INST) (k : Nat) : SolverM (Except String Nat) := do
+  guardTimeout
+  IO.println s!"tableau: {repr fms}"
+  if n < 0 then return Except.error "no proof at this level" else
+  match fms with
+  | [] => return Except.error "tableau: no proof"
+  | (.And p q)::unexp =>
+    tableau (p::q::unexp) lits n cont env k
+  | (.Or p q)::unexp =>
+    tableau (p::unexp) lits n (tableau (q::unexp) lits n cont) env k
+  | (.Forall x p)::unexp =>
+    let y := FOLTerm.Var s!"_{k}"
+    let p' := p.subst [(x, y)]
+    tableau (p'::unexp ++ [.Forall x p]) lits n cont env (k+1)
+  | fm::unexp =>
+    let f (lit : Formula) : SolverM (Except String Nat) := do
+      match unify_complements env (lit, fm) with
+      | .ok new_env => cont new_env k
+      | .error err => return Except.error err
+    match ← tryFirst f lits with
+    | .ok m => return Except.ok m
+    | .error _ =>
+      tableau unexp (fm::lits) n cont env k
+where
+  tryFirst (act : Formula → SolverM (Except String Nat)) (lits : List Formula) : SolverM (Except String Nat) := do
+    match lits with
+    | [] => return Except.error "tableau: no proof"
+    | lit::lits =>
+      match ← act lit with
+      | .ok m => return Except.ok m
+      | .error _ => tryFirst act lits
+
+partial def tabrefute (fms : List Formula) (n : Nat := 0) : SolverM Nat := do
+  IO.println s!"tableau: level {n}"
+  match ← tableau fms [] n (λ _ n => return Except.ok n) [] 0 with
+  | .ok m => return m
+  | .error _ => tabrefute fms (n+1)
+
+partial def tab (fm : Formula) := do
+  let sfm := askolemize (.Not (Formula.generalize fm))
+  if sfm == Formula.False then return 0 else
+  tabrefute [sfm]
+
 def solve (path : String) : SolverM String := do
   let cmds ← TPTP.compileFile path
   -- ensure there exists some conjectures
@@ -207,7 +250,7 @@ def solve (path : String) : SolverM String := do
 
   -- start solver
   try
-    let res := (← prawitz input)
+    let res := (← tab input)
     return s!"success: {res}"
   catch e =>
     return e.toString
