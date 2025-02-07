@@ -113,6 +113,10 @@ def guardTimeout : SolverM Unit := do
   else
     return
 
+def log {α : Type u} [ToString α] (l : α) : SolverM Unit := do
+  if (← read).config.verbose then
+    IO.println l
+
 partial def herbloop (mfn : MFNT) (tfn : DNFT → Bool) (fl0 : DNFT) (cntms : List FOLTerm) (funcs : List (String × Nat)) (fvs : List String) (n : Nat) (fl : DNFT) (tried : List (List FOLTerm)) (tuples : List (List FOLTerm)) : SolverM (List (List FOLTerm)) := do
   guardTimeout
   match tuples with
@@ -145,7 +149,6 @@ partial def gilmore (fm : Formula) : SolverM Nat := do
   let cntms : List FOLTerm := List.map (λ ((c, _) : String × Nat) => FOLTerm.Fn c []) consts
   return List.length <| (← gilmore_loop (simpdnf sfm) cntms funcs fvs 0 [[]] [] [])
 
-
 partial def unify_literals (env : INST) (tmp : Formula × Formula) : Except String INST := do
   match tmp with
   | (.R p1 a1, .R p2 a2) => unify env [(.Fn p1 a1, .Fn p2 a2)]
@@ -156,61 +159,35 @@ partial def unify_literals (env : INST) (tmp : Formula × Formula) : Except Stri
 partial def unify_complements (env : INST) (tmp : Formula × Formula) : Except String INST :=
   unify_literals env (tmp.1, tmp.2.negate)
 
-partial def unify_refute (djs : DNFT) (env : INST) : Except String INST := do
-  match djs with
-  | [] => return env
-  | d :: odjs =>
-    let (pos, neg) := List.partition Formula.positive d
-    let tmp := List.product pos neg
-    let f (p : Formula × Formula) : Except String INST := do
-      let new_e ← unify_complements env p
-      unify_refute odjs new_e
-    tryFirst f tmp
-where
-  tryFirst (act : Formula × Formula → Except String INST) (cs : List (Formula × Formula)) : Except String INST := do
-    match cs with
-    | [] => throw "No unifiable pairs"
-    | c :: ocs =>
-      match act c with
-      | .ok e => return e
-      | .error _ => tryFirst act ocs
-
-partial def prawitz_loop (djs0 : DNFT) (fvs : List String) (djs : DNFT) (n : Nat) : SolverM (INST × Nat) := do
+partial def tableau (fms lits : List Formula) (n : Int) (cont : INST → Nat → SolverM (Except String Nat)) (env : INST) (k : Nat) : SolverM (Except String Nat) := do
   guardTimeout
-  let l := fvs.length
-  let newVars := (List.range l).map λ k => FOLTerm.Var ("_" ++ s!"{n*l + k}")
-  let inst := λ (fm : Formula) => fm.subst (fvs.zip newVars)
-  let djs1 := distrib (List.map (List.map inst) djs0) djs
-  match unify_refute djs1 [] with
-  | .ok res => return (res, n)
-  | .error _ => prawitz_loop djs0 fvs djs1 (n + 1)
-where
-  distrib (d1 d2 : DNFT) : DNFT :=
-    List.foldr (fun x IH => if ∀ y ∈ IH, x != y then x :: IH else IH) [] <| -- Here do not influence the correctness, but it is faster.
-      (d1.product d2).map fun pq => (pq.1 ++ pq.2).eraseDup
-
-partial def prawitz (fm : Formula) : SolverM Nat := do
-  let fm0 := skolemize (.Not (Formula.generalize fm))
-  return (← prawitz_loop (simpdnf fm0) (fm0.fvs) [[]] 0).2
-
-partial def tableau (fms lits : List Formula) (n : Nat) (cont : INST → Nat → SolverM (Except String Nat)) (env : INST) (k : Nat) : SolverM (Except String Nat) := do
-  guardTimeout
-  IO.println s!"tableau: {repr fms}"
-  if n < 0 then return Except.error "no proof at this level" else
+  log s!"tableau: n = {n}; k = {k}"
+  log s!"fms: {repr fms}"
+  log s!"lits: {repr lits}"
+  if n < 0 then
+    log s!"tableau: no proof at this level"
+    return Except.error "no proof at this level"
+  else
   match fms with
-  | [] => return Except.error "tableau: no proof"
+  | [] =>
+    log s!"tableau: no proof"
+    return Except.error "tableau: no proof"
   | (.And p q)::unexp =>
     tableau (p::q::unexp) lits n cont env k
   | (.Or p q)::unexp =>
+    log s!"tableau: create a new branch"
     tableau (p::unexp) lits n (tableau (q::unexp) lits n cont) env k
   | (.Forall x p)::unexp =>
-    let y := FOLTerm.Var s!"_{k}"
+    let y := FOLTerm.Var s!"v_{k}"
     let p' := p.subst [(x, y)]
-    tableau (p'::unexp ++ [.Forall x p]) lits n cont env (k+1)
+    tableau (p'::unexp ++ [.Forall x p]) lits (n-1) cont env (k+1)
   | fm::unexp =>
     let f (lit : Formula) : SolverM (Except String Nat) := do
-      match unify_complements env (lit, fm) with
-      | .ok new_env => cont new_env k
+      match unify_complements env (fm, lit) with
+      | .ok new_env =>
+        log s!"tableau: find out contradiction"
+        log s!"({repr fm}; {repr lit})"
+        cont new_env k
       | .error err => return Except.error err
     match ← tryFirst f lits with
     | .ok m => return Except.ok m
@@ -225,14 +202,18 @@ where
       | .ok m => return Except.ok m
       | .error _ => tryFirst act lits
 
-partial def tabrefute (fms : List Formula) (n : Nat := 0) : SolverM Nat := do
-  IO.println s!"tableau: level {n}"
+partial def tabrefute (fms : List Formula) (n : Int := 0) : SolverM Nat := do
+  log s!"tableau: level {n}"
   match ← tableau fms [] n (λ _ n => return Except.ok n) [] 0 with
   | .ok m => return m
   | .error _ => tabrefute fms (n+1)
 
-partial def tab (fm : Formula) := do
-  let sfm := askolemize (.Not (Formula.generalize fm))
+partial def tab (fm : Formula) : SolverM Nat := do
+  log s!"tab: orignal formula = \n{repr fm}"
+  let gfm := Formula.generalize fm
+  log s!"tab: generalized formula = \n{repr gfm}"
+  let sfm := askolemize (.Not gfm)
+  log s!"tab: negated askolemized formula = \n{repr sfm}"
   if sfm == Formula.False then return 0 else
   tabrefute [sfm]
 
@@ -266,8 +247,8 @@ where
       Formula.Imp a target
 
 
-def solver (path : String) : IO Unit := do
-  let res ← (solve path).run
+def solver (path : String) (verbose : Bool := false): IO Unit := do
+  let res ← (solve path).run (cfg := {defaultConfig with verbose := verbose})
   IO.println res
 
 end ToyProver
